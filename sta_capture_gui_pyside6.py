@@ -8,9 +8,12 @@ import sys
 import os
 import re
 from pathlib import Path
+from collections import deque
+import gc
+import torch
 
 import cv2
-import pytesseract
+import easyocr
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QLabel, QPushButton, QSpinBox, QDoubleSpinBox, QLineEdit, QFileDialog,
@@ -34,9 +37,9 @@ class WorkerSignals(QObject):
 
 
 class ProcessWorker(QThread):
-    """Worker thread untuk processing video tanpa freeze UI"""
+    """Worker thread untuk processing video tanpa freeze UI dengan batch processing GPU"""
     
-    def __init__(self, video_path, roi, interval, output_folder, frame_skip, video_name=None):
+    def __init__(self, video_path, roi, interval, output_folder, frame_skip, video_name=None, batch_size=6):
         super().__init__()
         self.signals = WorkerSignals()
         self.video_path = video_path
@@ -46,6 +49,20 @@ class ProcessWorker(QThread):
         self.frame_skip = frame_skip
         self.video_name = video_name or Path(video_path).stem
         self.is_running = True
+        self.batch_size = batch_size  # Batch size untuk GPU processing (optimal: 4-8 untuk GTX 1050)
+        
+        # Initialize EasyOCR reader on GPU
+        try:
+            gpu_available = torch.cuda.is_available()
+            device = 'cuda' if gpu_available else 'cpu'
+            self.reader = easyocr.Reader(['en'], gpu=gpu_available, model_storage_directory=None)
+            self.device = device
+            device_name = f"GPU ({torch.cuda.get_device_name(0)})" if gpu_available else "CPU"
+            self.signals.log.emit(f"✅ EasyOCR initialized on {device_name}")
+        except Exception as e:
+            self.signals.log.emit(f"⚠️  EasyOCR GPU initialization failed, using CPU: {str(e)}")
+            self.reader = easyocr.Reader(['en'], gpu=False)
+            self.device = 'cpu'
     
     def run(self):
         try:
@@ -72,9 +89,21 @@ class ProcessWorker(QThread):
             self.signals.log.emit(f"🎯 ROI: x={x}, y={y}, w={w}, h={h}")
             self.signals.log.emit(f"📏 Interval: {self.interval}m\n")
             
+            # Main loop with batch processing
+            roi_batch = deque(maxlen=self.batch_size)  # ROI queue untuk batch
+            frame_batch = deque(maxlen=self.batch_size)  # Full frame queue untuk save
+            frame_idx_batch = deque(maxlen=self.batch_size)  # Frame indices
+            
             while True:
                 ret, frame = cap.read()
                 if not ret:
+                    # Process remaining batch sebelum break
+                    if roi_batch:
+                        last_value, last_saved_multiple, last_frame, last_ocr_text, saved_count, read_attempts, read_success = \
+                            self._process_batch(roi_batch, frame_batch, frame_idx_batch, 
+                                               last_value, last_saved_multiple, 
+                                               last_frame, last_ocr_text, saved_count, read_attempts, read_success,
+                                               self.output_folder, self.interval, x, y, w, h)
                     break
                 
                 if not self.is_running:
@@ -83,32 +112,17 @@ class ProcessWorker(QThread):
                 
                 if frame_idx % self.frame_skip == 0:
                     roi_img = frame[y:y + h, x:x + w]
-                    proc = self.preprocess(roi_img)
-                    text = self.ocr_read(proc)
-                    value = self.parse_sta(text)
-                    read_attempts += 1
+                    roi_batch.append(roi_img)
+                    frame_batch.append(frame.copy())
+                    frame_idx_batch.append(frame_idx)
                     
-                    if value is not None:
-                        read_success += 1
-                        if last_value is not None:
-                            diff = value - last_value
-                            if diff < -5 or diff > self.interval * 5:
-                                frame_idx += 1
-                                continue
-                        last_value = value
-                        last_frame = frame.copy()
-                        last_ocr_text = text
-                        
-                        current_multiple = int(value // self.interval) * self.interval
-                        if last_saved_multiple is None or current_multiple > last_saved_multiple:
-                            last_saved_multiple = current_multiple
-                            km = int(current_multiple // 1000)
-                            m = int(current_multiple % 1000)
-                            filename = f'STA_{km}+{m:03d}.jpg'
-                            filepath = os.path.join(self.output_folder, filename)
-                            cv2.imwrite(filepath, frame)
-                            saved_count += 1
-                            self.signals.log.emit(f'✓ {filename}  (OCR: "{text}")')
+                    # Process batch jika penuh
+                    if len(roi_batch) == self.batch_size:
+                        last_value, last_saved_multiple, last_frame, last_ocr_text, saved_count, read_attempts, read_success = \
+                            self._process_batch(roi_batch, frame_batch, frame_idx_batch, 
+                                               last_value, last_saved_multiple, 
+                                               last_frame, last_ocr_text, saved_count, read_attempts, read_success,
+                                               output_folder, interval, x, y, w, h)
                 
                 frame_idx += 1
                 progress = int(100 * frame_idx / total_frames)
@@ -134,8 +148,7 @@ class ProcessWorker(QThread):
                 
                 # Hybrid A+B: OCR pada ROI kecil (cepat) → Save FULL frame (lengkap)
                 roi_img = frame[y:y + h, x:x + w]
-                proc = self.preprocess(roi_img)
-                text = self.ocr_read(proc)
+                text = self.ocr_read(roi_img)  # Direct ROI OCR dengan EasyOCR
                 value = self.parse_sta(text)
                 
                 if value is not None:
@@ -182,6 +195,48 @@ class ProcessWorker(QThread):
     def stop(self):
         self.is_running = False
     
+    def _process_batch(self, roi_batch, frame_batch, frame_idx_batch, last_value, last_saved_multiple, 
+                       last_frame, last_ocr_text, saved_count, read_attempts, read_success,
+                       output_folder=None, interval=None, x=None, y=None, w=None, h=None):
+        """Process batch of ROI images with EasyOCR (GPU accelerated)"""
+        if not roi_batch:
+            return last_value, last_saved_multiple, last_frame, last_ocr_text, saved_count, read_attempts, read_success
+        
+        roi_list = list(roi_batch)
+        frame_list = list(frame_batch)
+        idx_list = list(frame_idx_batch)
+        
+        # Batch OCR processing (GPU)
+        ocr_texts = self.ocr_read_batch(roi_list)
+        
+        # Process results
+        for roi_idx, (ocr_text, full_frame, frame_idx) in enumerate(zip(ocr_texts, frame_list, idx_list)):
+            value = self.parse_sta(ocr_text)
+            read_attempts += 1
+            
+            if value is not None:
+                read_success += 1
+                if last_value is not None:
+                    diff = value - last_value
+                    if diff < -5 or diff > interval * 5:
+                        continue
+                last_value = value
+                last_frame = full_frame.copy()
+                last_ocr_text = ocr_text
+                
+                current_multiple = int(value // interval) * interval
+                if last_saved_multiple is None or current_multiple > last_saved_multiple:
+                    last_saved_multiple = current_multiple
+                    km = int(current_multiple // 1000)
+                    m = int(current_multiple % 1000)
+                    filename = f'STA_{km}+{m:03d}.jpg'
+                    filepath = os.path.join(output_folder, filename)
+                    cv2.imwrite(filepath, full_frame)
+                    saved_count += 1
+                    self.signals.log.emit(f'✓ {filename}  (OCR: "{ocr_text}")')
+        
+        return last_value, last_saved_multiple, last_frame, last_ocr_text, saved_count, read_attempts, read_success
+    
     @staticmethod
     def parse_sta(text):
         """Parse STA value from text - support both formats:
@@ -210,18 +265,44 @@ class ProcessWorker(QThread):
         return None
     
     @staticmethod
-    def preprocess(roi_img, scale=3):
-        gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
-        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-        gray = cv2.GaussianBlur(gray, (3, 3), 0)
-        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        return thresh
+    def preprocess(roi_img, scale=1):
+        """Preprocess untuk EasyOCR - lightweight preprocessing saja"""
+        # Resize untuk better OCR accuracy
+        h, w = roi_img.shape[:2]
+        roi_resized = cv2.resize(roi_img, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
+        return roi_resized
     
-    @staticmethod
-    def ocr_read(img):
-        config = '--psm 7 -c tessedit_char_whitelist=0123456789+.STA'
-        text = pytesseract.image_to_string(img, config=config)
-        return text.strip()
+    def ocr_read(self, img):
+        """Single image OCR dengan EasyOCR"""
+        try:
+            results = self.reader.readtext(img, detail=0)  # detail=0 untuk hanya text
+            text = ''.join(results)
+            return text.strip()
+        except Exception as e:
+            self.signals.log.emit(f"⚠️  OCR error: {str(e)}")
+            return ""
+    
+    def ocr_read_batch(self, img_list):
+        """Batch OCR processing (GPU optimized) - multiple images at once"""
+        try:
+            # EasyOCR readtext dapat handle list of images (batch processing)
+            batch_results = []
+            for img in img_list:
+                try:
+                    results = self.reader.readtext(img, detail=0)
+                    text = ''.join(results).strip()
+                    batch_results.append(text)
+                except:
+                    batch_results.append("")
+            
+            # Clean up GPU memory setelah batch
+            if self.device == 'cuda':
+                torch.cuda.empty_cache()
+            
+            return batch_results
+        except Exception as e:
+            self.signals.log.emit(f"⚠️  Batch OCR error: {str(e)}")
+            return [""] * len(img_list)
 
 
 class VideoPreviewWidget(QFrame):
@@ -1062,7 +1143,8 @@ class STACaptureGUI(QMainWindow):
             self.interval_spin.value(),
             video_output,
             self.skip_spin.value(),
-            video_name
+            video_name,
+            batch_size=6  # Optimal untuk GTX 1050
         )
         self.worker.signals.progress.connect(self._on_progress)
         self.worker.signals.log.connect(self._on_log)
@@ -1133,25 +1215,29 @@ class STACaptureGUI(QMainWindow):
         self._toggle_roi_drawing()
     
     def _check_tesseract(self):
-        """Check if Tesseract-OCR is installed"""
+        """Check if EasyOCR and dependencies are installed"""
         try:
-            version = pytesseract.get_tesseract_version()
-            self.statusBar().showMessage(f"✓ Tesseract-OCR {version} detected")
-        except pytesseract.TesseractNotFoundError:
+            import easyocr
+            import torch
+            gpu_available = torch.cuda.is_available()
+            device_msg = f"CUDA GPU ({torch.cuda.get_device_name(0)})" if gpu_available else "CPU"
+            self.statusBar().showMessage(f"✅ EasyOCR ready | Device: {device_msg}")
+            return True
+        except ImportError as e:
             QMessageBox.warning(
                 self,
-                "Tesseract-OCR Not Found",
-                "Tesseract-OCR is not installed or not in PATH.\n\n"
-                "Without Tesseract-OCR, OCR features won't work.\n\n"
-                "To install:\n"
-                "1. Download from: https://github.com/UB-Mannheim/tesseract/wiki\n"
-                "2. Run the Windows installer\n"
-                "3. Check 'Add to PATH' during installation\n"
-                "4. Restart this application\n\n"
-                "For now, you can still use the app for ROI selection and manual testing."
+                "EasyOCR Dependencies Not Found",
+                "EasyOCR or required dependencies are not installed.\n\n"
+                "To install, run in terminal:\n"
+                "  pip install easyocr torch torchvision\n\n"
+                "For GPU support (NVIDIA):\n"
+                "  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118\n\n"
+                "After installation, restart this application."
             )
+            return False
         except Exception as e:
-            self.statusBar().showMessage(f"⚠ Tesseract check warning: {str(e)}")
+            self.statusBar().showMessage(f"⚠️  EasyOCR check warning: {str(e)}")
+            return False
     
     def _show_welcome(self):
         """Show welcome message dengan instruksi penggunaan"""
@@ -1206,7 +1292,8 @@ class STACaptureGUI(QMainWindow):
             self.interval_spin.value(),
             output_folder,
             self.skip_spin.value(),
-            Path(self.video_path).stem
+            Path(self.video_path).stem,
+            batch_size=6  # Optimal untuk GTX 1050
         )
         self.worker.signals.progress.connect(self._on_progress)
         self.worker.signals.log.connect(self._on_log)
