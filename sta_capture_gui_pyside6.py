@@ -132,6 +132,7 @@ class ProcessWorker(QThread):
                 if not ret:
                     continue
                 
+                # Hybrid A+B: OCR pada ROI kecil (cepat) → Save FULL frame (lengkap)
                 roi_img = frame[y:y + h, x:x + w]
                 proc = self.preprocess(roi_img)
                 text = self.ocr_read(proc)
@@ -141,7 +142,7 @@ class ProcessWorker(QThread):
                     # Check if this value is reasonable (not anomaly)
                     if last_value is None or (value >= last_value and (value - last_value) <= self.interval * 5):
                         last_valid_value = value
-                        last_valid_frame = frame.copy()
+                        last_valid_frame = frame.copy()  # Save FULL frame, not just ROI
                         last_valid_text = text
                         read_attempts += 1
                         read_success += 1
